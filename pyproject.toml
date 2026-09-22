@@ -1,0 +1,53 @@
+[project]
+name = "jaxlit"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+# jaxloop is vendored at ./jaxloop rather than installed — see jaxloop/VENDORED.md.
+# Its runtime deps (clu, optax, jaxtyping, absl-py, etils, tensorflow, tensorboard)
+# are therefore declared here directly.
+dependencies = [
+    "absl-py>=2.5.0",
+    "attrs>=26.1.0",
+    "clu>=0.0.12",
+    "eincheck>=0.6.3",
+    "etils>=1.14.0",
+    "flax>=0.12.9",
+    "grain>=0.2.18",
+    "importlib-resources>=7.1.0",
+    "jax>=0.11.1",
+    "jaxtyping>=0.3.4",
+    "numpy>=2.5.2",
+    "optax>=0.2.6",
+    "orbax>=0.1.9",
+    "pandas>=3.0.5",
+    "protobuf>=7.36.1",
+    "pytest>=9.1.1",
+    "tensorboard>=2.20.0",
+]
+
+[tool.pytest.ini_options]
+# Test files live next to the code with no __init__.py, so pytest only puts
+# their own directory on sys.path. Add the project root too, so a test can
+# import its subject by package path (`from commmon.mlp import ...`).
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 88
+indent-width = 4
+# jaxloop is vendored upstream code in Google style (2-space, 80 col). Leave it
+# alone so `ruff format` never churns the whole subtree into our style.
+extend-exclude = ["jaxloop"]
+
+[tool.ruff.lint]
+# ruff's default rule set is E4,E7,E9,F -- F401 (unused imports) is already in
+# it, but import sorting is not. `I` is isort; the editor's format action and
+# `ruff check --fix` both act on it.
+extend-select = ["I"]
+
+[tool.ruff.format]
+# Keep a magic trailing comma meaningful: when you leave a trailing comma after
+# the last argument, ruff explodes the list one-per-line and keeps it that way.
+# Without it, ruff packs as many args as fit onto the continuation line.
+skip-magic-trailing-comma = false

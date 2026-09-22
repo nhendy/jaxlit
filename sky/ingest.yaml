@@ -1,0 +1,75 @@
+# Parallel dataset conversion: N CPU nodes, each converting its own stride of
+# the corpus straight into R2.
+#
+#   sky jobs launch sky/ingest.yaml \
+#     --env DATASET=av2 --env SRC=/data/av2/train --env SPLIT=train
+#
+# This is the "Beam pipeline" without Beam. The conversion is embarrassingly
+# parallel -- every scenario is independent -- so a distributed data framework
+# would buy shuffling and fault-tolerant DAGs that this job has no use for.
+# SkyPilot already hands each node SKYPILOT_NODE_RANK and SKYPILOT_NUM_NODES,
+# which is the entire coordination requirement.
+#
+# `sky jobs launch` (not `sky launch`) so a preempted spot node is recovered
+# and its stride re-run, rather than silently leaving a hole in the corpus.
+
+name: jaxlit-ingest
+
+num_nodes: 8
+
+resources:
+  cpus: 16+
+  memory: 64+
+  disk_size: 512
+  use_spot: true          # conversion is restartable; spot is ~3x cheaper
+
+envs:
+  DATASET: av2
+  SRC: ""
+  SPLIT: train
+  R2_BUCKET: jaxlit-data
+  SHARDS_PER_WORKER: "32"
+
+# Secrets arrive as env vars, never as files in the image or the repo.
+# Populate them at launch from your keychain:
+#   sky jobs launch ... \
+#     --env R2_ACCESS_KEY_ID="$(security find-generic-password -a $USER -s R2_ACCESS_KEY_ID -w)" \
+#     --env R2_SECRET_ACCESS_KEY="$(security find-generic-password -a $USER -s R2_SECRET -w)" \
+#     --env R2_ACCOUNT_ID="$(security find-generic-password -a $USER -s R2_ACCOUNT_ID -w)"
+
+workdir: .
+
+setup: |
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  uv sync --frozen
+  curl -fsSL https://rclone.org/install.sh | sudo bash
+
+run: |
+  set -euo pipefail
+
+  # rclone reads a whole remote from env vars -- no config file is written to
+  # the node's disk at any point.
+  export RCLONE_CONFIG_R2_TYPE=s3
+  export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
+  export RCLONE_CONFIG_R2_REGION=auto
+  export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+  export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+  export RCLONE_CONFIG_R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+  STAGE="/tmp/stage-${SKYPILOT_NODE_RANK}"
+  DEST="r2:${R2_BUCKET}/index/${DATASET}/motion/${SPLIT}"
+
+  # Each node decodes only its own stride. The worker index is baked into the
+  # shard filenames, so all 8 nodes can sync into one prefix without collisions.
+  uv run python -m data.ingest \
+    --dataset="$DATASET" \
+    --src="$SRC" \
+    --out="$STAGE" \
+    --num_shards="$SHARDS_PER_WORKER" \
+    --num_workers="$SKYPILOT_NUM_NODES" \
+    --worker_index="$SKYPILOT_NODE_RANK"
+
+  rclone sync "$STAGE" "$DEST" --transfers=16 --checksum --stats=30s
+  rclone check "$STAGE" "$DEST" --checksum --one-way
+
+  echo "node ${SKYPILOT_NODE_RANK}/${SKYPILOT_NUM_NODES} done -> ${DEST}"
