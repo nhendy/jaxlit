@@ -11,6 +11,8 @@ import pytest
 from commmon.fixtures import parameterized_fixture
 from commmon.geometry import (
     arc_length,
+    box_corners,
+    chunk_polyline,
     distance_to,
     heading_of,
     resample_polyline,
@@ -148,6 +150,121 @@ def test_transform_se2_translates_before_rotating() -> None:
     np.testing.assert_allclose(out, [[1.0, 0.0]], atol=1e-6)
 
 
+# --- oriented boxes -----------------------------------------------------------
+
+
+@pytest.fixture
+def box() -> dict[str, np.ndarray]:
+    """A 4x2 m box at the origin, axis aligned -- easy to reason about by hand."""
+    return {
+        "center": np.zeros(2),
+        "extent": np.array([4.0, 2.0]),
+    }
+
+
+def test_box_corners_at_zero_heading(box: dict[str, np.ndarray]) -> None:
+    """Pins both the corner order and which half-extent is which."""
+    out = np.asarray(box_corners(box["center"], np.float64(0.0), box["extent"]))
+    np.testing.assert_allclose(
+        out, [[-2.0, -1.0], [2.0, -1.0], [2.0, 1.0], [-2.0, 1.0]], atol=1e-6
+    )
+
+
+def test_box_length_lies_along_the_heading(
+    box: dict[str, np.ndarray], angle: float
+) -> None:
+    """The failure this catches: length and width swapped."""
+    out = np.asarray(box_corners(box["center"], np.float64(angle), box["extent"]))
+    forward = np.asarray(rotate(np.array([1.0, 0.0]), np.float64(angle)))
+    along = (out[1] + out[2]) / 2.0 - (out[0] + out[3]) / 2.0
+    np.testing.assert_allclose(along, 4.0 * forward, atol=1e-5)
+
+
+def test_box_edges_keep_their_lengths(box: dict[str, np.ndarray], angle: float) -> None:
+    """Rigidity: rotation must not stretch the box."""
+    out = np.asarray(box_corners(box["center"], np.float64(angle), box["extent"]))
+    edges = np.linalg.norm(np.diff(np.concatenate([out, out[:1]]), axis=0), axis=-1)
+    np.testing.assert_allclose(edges, [4.0, 2.0, 4.0, 2.0], atol=1e-5)
+
+
+def test_box_corners_stay_centred(box: dict[str, np.ndarray], angle: float) -> None:
+    center = np.array([3.0, -7.0])
+    out = np.asarray(box_corners(center, np.float64(angle), box["extent"]))
+    np.testing.assert_allclose(out.mean(axis=0), center, atol=1e-5)
+
+
+def test_box_corners_are_counter_clockwise(
+    box: dict[str, np.ndarray], angle: float
+) -> None:
+    """Shoelace area is positive only for the counter-clockwise winding."""
+    out = np.asarray(box_corners(box["center"], np.float64(angle), box["extent"]))
+    shifted = np.roll(out, -1, axis=0)
+    area = 0.5 * np.sum(out[:, 0] * shifted[:, 1] - shifted[:, 0] * out[:, 1])
+    assert area == pytest.approx(8.0, abs=1e-4)
+
+
+def test_box_corners_rotate_with_the_frame(
+    box: dict[str, np.ndarray], angle: float
+) -> None:
+    """Building in one frame then rotating must match building in the other."""
+    turned = np.asarray(box_corners(box["center"], np.float64(angle), box["extent"]))
+    direct = np.asarray(
+        rotate(box_corners(box["center"], np.float64(0.0), box["extent"]), angle)
+    )
+    np.testing.assert_allclose(turned, direct, atol=1e-5)
+
+
+def test_box_corners_batch_over_agents() -> None:
+    out = np.asarray(box_corners(np.zeros((5, 2)), np.zeros(5), np.ones((5, 2))))
+    assert out.shape == (5, 4, 2)
+
+
+def test_one_extent_serves_a_whole_trajectory() -> None:
+    """The broadcast that matters: extent is per agent, pose is per step."""
+    out = np.asarray(
+        box_corners(np.zeros((5, 6, 2)), np.zeros((5, 6)), np.ones((5, 1, 2)))
+    )
+    assert out.shape == (5, 6, 4, 2)
+
+
+def test_batched_box_matches_one_at_a_time() -> None:
+    rng = np.random.default_rng(0)
+    center = rng.standard_normal((4, 2))
+    heading = rng.uniform(-np.pi, np.pi, size=4)
+    extent = rng.uniform(1.0, 5.0, size=(4, 2))
+    batched = np.asarray(box_corners(center, heading, extent))
+    for i in range(4):
+        np.testing.assert_allclose(
+            batched[i],
+            np.asarray(box_corners(center[i], heading[i], extent[i])),
+            atol=1e-6,
+        )
+
+
+def test_box_corners_reject_a_misaligned_extent() -> None:
+    """A per-agent `(a, 2)` extent against `(a, t, 2)` centres needs `(a, 1, 2)`.
+
+    Without the explicit broadcast it would silently align `a` against `t`.
+    """
+    with pytest.raises(ValueError, match="broadcast"):
+        box_corners(np.zeros((4, 3, 2)), np.zeros((4, 3)), np.ones((4, 2)))
+
+
+def test_a_shared_extent_serves_every_box() -> None:
+    out = np.asarray(box_corners(np.zeros((5, 2)), np.zeros(5), np.array([4.0, 2.0])))
+    assert out.shape == (5, 4, 2)
+    np.testing.assert_allclose(out[0], out[-1], atol=1e-6)
+
+
+def test_box_corners_trace_under_jit(jnp_module) -> None:
+    import jax
+
+    out = jax.jit(box_corners)(
+        jnp_module.zeros((3, 2)), jnp_module.zeros(3), jnp_module.ones((3, 2))
+    )
+    assert out.shape == (3, 4, 2)
+
+
 # --- polylines ----------------------------------------------------------------
 
 
@@ -203,6 +320,126 @@ def test_resample_commutes_with_rotation(angle: float) -> None:
     a = np.asarray(rotate(resample_polyline(line, 9), angle))
     b = np.asarray(resample_polyline(np.asarray(rotate(line, angle)), 9))
     np.testing.assert_allclose(a, b, atol=1e-4)
+
+
+# --- chunking -----------------------------------------------------------------
+
+
+@pytest.fixture
+def long_line() -> np.ndarray:
+    """A 400 m straight -- far longer than one 20-point chunk can resolve."""
+    return np.array([[0.0, 0.0], [400.0, 0.0]])
+
+
+def test_chunking_respects_the_spacing_cap(long_line: np.ndarray) -> None:
+    out = np.asarray(chunk_polyline(long_line, 20, 2.0))
+    step = np.linalg.norm(np.diff(out, axis=1), axis=-1)
+    assert step.max() <= 2.0 + 1e-6, "a chunk exceeded max_spacing"
+
+
+def test_chunk_count_is_the_minimum_that_fits(long_line: np.ndarray) -> None:
+    """One chunk spans `max_spacing * (num_points - 1)` = 38 m, so 400 m needs 11."""
+    assert np.asarray(chunk_polyline(long_line, 20, 2.0)).shape == (11, 20, 2)
+
+
+def test_chunks_share_endpoints(long_line: np.ndarray) -> None:
+    """The seam invariant: a gap here would read as a break in the road."""
+    out = np.asarray(chunk_polyline(long_line, 20, 2.0))
+    np.testing.assert_allclose(out[:-1, -1], out[1:, 0], atol=1e-6)
+
+
+def test_chunks_reassemble_into_the_original(angle: float) -> None:
+    line = np.asarray(
+        rotate(np.array([[0.0, 0.0], [120.0, 0.0], [120.0, 90.0]]), angle)
+    )
+    out = np.asarray(chunk_polyline(line, 20, 2.0))
+    # Dropping each chunk's shared first point leaves one unbroken polyline.
+    joined = np.concatenate([out[0], *(chunk[1:] for chunk in out[1:])])
+    np.testing.assert_allclose(joined[0], line[0], atol=1e-4)
+    np.testing.assert_allclose(joined[-1], line[-1], atol=1e-4)
+    # Chording a corner can only shorten the path, and by at most about one
+    # spacing per corner -- this line has one.
+    total = float(np.asarray(arc_length(line))[-1])
+    joined_length = np.linalg.norm(np.diff(joined, axis=0), axis=-1).sum()
+    assert total - 2.0 <= joined_length <= total + 1e-6
+
+
+def test_a_short_polyline_is_one_chunk() -> None:
+    """Below the cap nothing is split, so lanes stay one polyline each."""
+    line = np.array([[0.0, 0.0], [20.0, 0.0]])
+    assert np.asarray(chunk_polyline(line, 20, 2.0)).shape == (1, 20, 2)
+
+
+def test_infinite_spacing_is_plain_resampling() -> None:
+    """The opt-out a dataset uses when its polyline budget binds."""
+    line = np.array([[0.0, 0.0], [500.0, 0.0], [500.0, 250.0]])
+    out = np.asarray(chunk_polyline(line, 20, float("inf")))
+    assert out.shape == (1, 20, 2)
+    np.testing.assert_allclose(
+        out[0], np.asarray(resample_polyline(line, 20)), atol=1e-6
+    )
+
+
+def test_chunking_beats_resampling_on_a_long_ring() -> None:
+    """The bug this exists for: a fixed budget chords straight across the road.
+
+    Shaped like a real drivable area -- a long, narrow ring around a street --
+    rather than a circle. A circle is the *kindest* case for uniform
+    resampling; an elongated ring is where 20 points start cutting corners off
+    entirely.
+    """
+    corners = np.array(
+        [[0.0, 0.0], [200.0, 0.0], [200.0, 12.0], [0.0, 12.0], [0.0, 0.0]]
+    )
+    ring = np.concatenate(
+        [
+            np.linspace(a, b, max(2, int(np.linalg.norm(b - a))), endpoint=False)
+            for a, b in zip(corners[:-1], corners[1:])
+        ]
+        + [corners[-1:]]
+    )
+
+    def deviation(polyline: np.ndarray) -> float:
+        a, b = polyline[:-1], polyline[1:]
+        d = b - a
+        # Chunk seams repeat a point, so some segments have zero length.
+        length = np.maximum((d * d).sum(-1), 1e-12)
+        u = np.clip(((ring[:, None] - a) * d).sum(-1) / length, 0.0, 1.0)
+        near = a + u[..., None] * d
+        return float(np.linalg.norm(ring[:, None] - near, axis=-1).min(axis=1).max())
+
+    flat = deviation(np.asarray(resample_polyline(ring, 20)))
+    chunked = deviation(np.asarray(chunk_polyline(ring, 20, 2.0)).reshape(-1, 2))
+
+    assert flat > 5.0, "fixture is not long enough to show the problem"
+    # What is left is the corner cut, not the spacing: a 2 m chord across a
+    # right angle loses at most ~1 m however many chunks there are. Real AV2
+    # drivable areas bottom out in the same place (p99 0.70 m).
+    assert chunked < 1.0
+    assert chunked < flat / 10.0
+
+
+def test_chunking_handles_a_single_point() -> None:
+    """Stop signs are one vertex; the degenerate answer is that point repeated."""
+    out = np.asarray(chunk_polyline(np.array([[3.0, 4.0]]), 20, 2.0))
+    assert out.shape == (1, 20, 2)
+    np.testing.assert_allclose(out[0], np.tile([3.0, 4.0], (20, 1)), atol=1e-6)
+
+
+def test_chunking_handles_a_zero_length_polyline() -> None:
+    out = np.asarray(chunk_polyline(np.array([[1.0, 1.0], [1.0, 1.0]]), 20, 2.0))
+    assert out.shape == (1, 20, 2)
+    assert np.isfinite(out).all()
+
+
+def test_chunking_rejects_a_degenerate_chunk_size() -> None:
+    with pytest.raises(ValueError, match="num_points"):
+        chunk_polyline(np.array([[0.0, 0.0], [1.0, 0.0]]), 1, 2.0)
+
+
+def test_chunking_rejects_non_positive_spacing() -> None:
+    with pytest.raises(ValueError, match="max_spacing"):
+        chunk_polyline(np.array([[0.0, 0.0], [1.0, 0.0]]), 20, 0.0)
 
 
 # --- distances ----------------------------------------------------------------
