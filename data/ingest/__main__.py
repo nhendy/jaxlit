@@ -1,7 +1,7 @@
 """Ingest CLI: raw dataset -> ArrayRecord shards of canonical `Scenario`s.
 
     uv run python -m data.ingest \\
-        --dataset=argoverse --src=/data/av2/val --out=/data/ingested/av2-val
+        --dataset=av2 --src=/data/av2/val --out=/data/ingested/av2-val
 
 This is the one-time conversion the whole library is built around. Afterwards
 nothing downstream knows which dataset the bytes came from -- `data.pipeline`
@@ -13,21 +13,26 @@ them). An entrypoint that never parses them dies the moment it enables
 multiprocessing. See the repo `conftest.py` for the pytest equivalent.
 """
 
+import pathlib
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 from absl import app, flags, logging
 from etils import epath
 
 from data.ingest.writer import read_shards, write_shards
 from data.schema import Scenario
+from data.sources import argoverse, womd
 from data.specs import ALL_SPECS, DatasetSpec
 
 _DATASET = flags.DEFINE_enum(
     "dataset", None, sorted(ALL_SPECS), "Which dataset to ingest.", required=True
 )
 _SRC = flags.DEFINE_string(
-    "src", None, "Raw dataset root (a local directory).", required=True
+    "src",
+    "~/datasets/av2/val/",
+    "Raw dataset root (a local directory).",
+    required=False,
 )
 _OUT = flags.DEFINE_string("out", None, "Output directory.", required=True)
 _NUM_SHARDS = flags.DEFINE_integer("num_shards", 64, "ArrayRecord shards to write.")
@@ -46,21 +51,25 @@ _WORKER_INDEX = flags.DEFINE_integer(
 )
 
 
-def _source(dataset: str) -> tuple[DatasetSpec, object]:
-    """Resolve a dataset name to its spec and `iter_scenarios`.
+type ScenarioReader = Callable[[epath.Path, DatasetSpec, int, int], Iterator[Scenario]]
+"""`(src, spec, worker_index, num_workers) -> this worker's scenarios`."""
 
-    Imported lazily so a missing adapter is a clear message about *that*
-    dataset, not an import error at CLI start for the two you are not using.
-    """
+
+def _source(dataset: str) -> tuple[DatasetSpec, ScenarioReader]:
+    """Resolve a dataset name to its spec and a per-worker scenario reader."""
     spec = ALL_SPECS[dataset]
     if dataset == "av2":
-        from data.sources import argoverse
-
-        return spec, argoverse.iter_scenarios
+        # One directory per scenario: workers split the listing and decode only
+        # their own.
+        return spec, lambda src, spec, index, count: argoverse.iter_scenarios(
+            pathlib.Path(src), spec, worker_index=index, num_workers=count
+        )
     if dataset == "womd":
-        from data.sources import womd
-
-        return spec, womd.iter_scenarios
+        # Records are packed into shards, so a worker still reads them all and
+        # keeps its share.
+        return spec, lambda src, spec, index, count: _shard(
+            womd.iter_scenarios(pathlib.Path(src), spec), index, count
+        )
     if dataset == "nuscenes":
         raise NotImplementedError(
             "the nuScenes adapter is not written yet (build order step 6); it "
@@ -134,15 +143,23 @@ def main(argv: list[str]) -> None:
             "Copy the shards down first:\n"
             f"  gcloud storage cp -r {_SRC.value} /local/scratch/"
         )
-    src = epath.Path(_SRC.value)
+    # expanduser, because a `~` path only survives to here when the shell did
+    # not expand it: tilde expansion happens at the start of a word, so
+    # `--src=~/x` arrives literal (as does the default below), while
+    # `--src ~/x` arrives already absolute. epath does not expand it either.
+    src = epath.Path(_SRC.value).expanduser()
     if not src.is_dir():
         raise app.UsageError(f"--src is not a directory: {src}")
     # Output always stages locally: ArrayRecordWriter is a C++ extension that
     # writes local files. rclone moves it to object storage afterwards.
-    out = epath.Path(_OUT.value)
+    out = epath.Path(_OUT.value).expanduser()
 
-    spec, iter_scenarios = _source(_DATASET.value)
+    spec, read = _source(_DATASET.value)
     num_workers, worker_index = _NUM_WORKERS.value, _WORKER_INDEX.value
+    if not 0 <= worker_index < num_workers:
+        raise app.UsageError(
+            f"--worker_index {worker_index} outside [0, {num_workers})"
+        )
 
     # The shard prefix carries the worker index, so N workers writing into the
     # same output directory cannot collide on a filename.
@@ -159,7 +176,7 @@ def main(argv: list[str]) -> None:
         num_workers,
     )
     started = time.perf_counter()
-    scenarios = _shard(iter_scenarios(src, spec), worker_index, num_workers)
+    scenarios = read(src, spec, worker_index, num_workers)
     paths = write_shards(
         _progress(scenarios, _LIMIT.value),
         out,

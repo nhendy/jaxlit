@@ -17,17 +17,19 @@ class MLPConfig:
     # Activation
     activation: Literal["relu", "gelu", "linear"]
 
-    def make(self) -> "MLP":
-        return MLP(self)
+    def make(self, dtype: jt.DTypeLike | None = None) -> "MLP":
+        return MLP(self, dtype=dtype)
 
 
 class MLP(nn.Module):
     config: MLPConfig
+    # Compute dtype of the layers (params stay float32). A module attribute,
+    # not a call argument: flax's `tabulate` traces call arguments as arrays.
+    dtype: jt.DTypeLike | None = None
 
     @nn.compact
-    def __call__(
-        self, x: jax.Array, *, train: bool, dtype: jt.DTypeLike | None = None
-    ) -> jax.Array:
+    def __call__(self, x: jax.Array, *, train: bool) -> jax.Array:
+        dtype = self.dtype
         for i, unit in enumerate(self.config.units):
             x = nn.Dense(
                 features=unit, use_bias=self.config.norm != "batch", dtype=dtype
@@ -35,9 +37,9 @@ class MLP(nn.Module):
             if i != len(self.config.units) - 1:
                 match self.config.norm:
                     case "batch":
-                        x = nn.BatchNorm(use_running_average=not train)(x)
+                        x = nn.BatchNorm(use_running_average=not train, dtype=dtype)(x)
                     case "layer":
-                        x = nn.LayerNorm()(x)
+                        x = nn.LayerNorm(dtype=dtype)(x)
                     case _:
                         raise ValueError(f"Unknown norm {self.norm}")
 

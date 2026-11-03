@@ -9,6 +9,7 @@ whole reason this conversion step exists.
 import pathlib
 from collections.abc import Iterable, Iterator
 
+import grain
 from array_record.python.array_record_module import ArrayRecordWriter
 
 from data import codec
@@ -81,7 +82,6 @@ def write_shards(
 
 def read_shards(paths: Iterable[pathlib.Path]) -> Iterator[Scenario]:
     """Decode every record back, for verifying an ingest run."""
-    import grain
 
     source = grain.sources.ArrayRecordDataSource([str(p) for p in paths])
     for i in range(len(source)):

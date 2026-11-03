@@ -9,12 +9,13 @@ easier to read in-process.
 import pathlib
 
 import attrs
+import grain
 import numpy as np
 import pytest
 
 from commmon.fixtures import parameterized_fixture
 from data.ingest.writer import read_shards, write_shards
-from data.pipeline import build
+from data.pipeline import Stages, build
 from data.schema import Scenario, decode_scenario_id
 from data.specs import ALL_SPECS, AV2, DEFAULT_BUDGETS, Budget, DatasetSpec
 from data.testing import synthetic_scenario
@@ -342,9 +343,88 @@ def test_multiprocess_prefetch_matches_inprocess(
 
 def test_unpadded_scenarios_cannot_be_batched(spec: DatasetSpec) -> None:
     """Forgetting PadAndMask is a loud failure, not silent corruption."""
-    import grain
 
     a = synthetic_scenario(spec, 3, 5)
     b = synthetic_scenario(spec, 8, 5)
     with pytest.raises(Exception):
         grain.MapDataset.source([a, b]).batch(2)[0]
+
+
+# --- lean pipelines -------------------------------------------------------------
+
+
+def test_drop_map_keeps_shapes_and_masks_every_polyline(
+    shards: list[pathlib.Path], spec: DatasetSpec, budget: Budget
+) -> None:
+    batch = next(
+        iter(
+            build(
+                shards,
+                spec,
+                batch_size=BATCH,
+                seed=0,
+                budget=budget,
+                stages=Stages(keep_map=False),
+            )
+        )
+    )
+    assert np.asarray(batch.vector_map.points).shape == (
+        BATCH,
+        budget.max_polylines,
+        spec.max_points,
+        2,
+    )
+    assert not np.asarray(batch.polyline_mask).any()
+    assert not np.asarray(batch.vector_map.valid).any()
+    # Agents are untouched.
+    assert np.asarray(batch.agent_mask).any()
+
+
+def test_source_frame_leaves_positions_unmoved(
+    shards: list[pathlib.Path], spec: DatasetSpec, budget: Budget
+) -> None:
+    def first(ego_frame: bool) -> np.ndarray:
+        ds = build(
+            shards,
+            spec,
+            batch_size=1,
+            seed=0,
+            budget=budget,
+            training=False,
+            stages=Stages(ego_frame=ego_frame),
+        )
+        return np.asarray(next(iter(ds)).agents.position)
+
+    centred, source = first(True), first(False)
+    t_ref = spec.num_history - 1
+    ego_now = source[0, 0, t_ref]
+    # Synthetic agent 0 is the ego: at the origin only when re-centred.
+    np.testing.assert_allclose(centred[0, 0, t_ref], 0.0, atol=1e-3)
+    assert np.linalg.norm(ego_now) > 1.0
+
+
+def test_augment_requires_the_ego_frame(
+    shards: list[pathlib.Path], spec: DatasetSpec
+) -> None:
+    with pytest.raises(ValueError, match="ego_frame"):
+        Stages(ego_frame=False, augment=True)
+    with pytest.raises(ValueError, match="ego_frame"):
+        # augment=None means "when training": caught at build time instead.
+        build(shards, spec, batch_size=BATCH, seed=0, stages=Stages(ego_frame=False))
+
+
+def test_checks_off_in_spawned_workers(
+    shards: list[pathlib.Path], spec: DatasetSpec, budget: Budget
+) -> None:
+    """The setting reaches Grain's spawned workers and batches still arrive."""
+    ds = build(
+        shards,
+        spec,
+        batch_size=BATCH,
+        seed=0,
+        budget=budget,
+        shape_checks=False,
+        num_workers=2,
+    )
+    batch = next(iter(ds))
+    assert np.asarray(batch.agents.position).shape[0] == BATCH

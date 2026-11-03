@@ -9,6 +9,7 @@ fall behind the schema.
 import jax
 import numpy as np
 import pytest
+from flax import serialization
 
 from commmon.fixtures import parameterized_fixture
 from data.codec import decode, encode
@@ -147,7 +148,6 @@ def test_codec_roundtrip_after_device_put(scenario: Scenario) -> None:
 
 
 def test_codec_rejects_unknown_spec(scenario: Scenario) -> None:
-    from flax import serialization
 
     raw = serialization.msgpack_restore(encode(scenario))
     raw["spec"] = "not-a-dataset"

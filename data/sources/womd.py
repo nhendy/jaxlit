@@ -54,12 +54,13 @@ def _map_features(scenario, spec: DatasetSpec) -> tuple[np.ndarray, np.ndarray]:
 
     Every feature is resampled to `spec.max_points`, which is genuinely lossy
     here: WOMD polylines are dense (measured p50 37 points, p90 158, max 1578)
-    where AV2's are sparse. The alternative -- splitting long features into
-    fixed-length segments -- preserves geometry but multiplies the polyline
-    count several-fold, and the map budget is already the binding constraint
-    (p99 840 features per scenario). Resampling keeps one polyline per feature
-    and keeps the two datasets structurally identical; raise
-    `DatasetSpec.max_points` if the fidelity matters more than the budget.
+    where AV2's are sparse. Splitting long features into fixed-length segments
+    preserves the geometry but multiplies the polyline count several-fold, and
+    the map budget is already the binding constraint (p99 840 features per
+    scenario) -- so WOMD leaves `spec.max_spacing` at its default `inf`, which
+    is one polyline per feature. AV2 sets it, because there a single feature can
+    be a half-kilometre ring. Set it here too, or raise `max_points`, if the
+    fidelity turns out to matter more than the budget.
     """
     points: list[np.ndarray] = []
     types: list[int] = []

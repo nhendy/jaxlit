@@ -11,6 +11,7 @@ Two tiers, because the licence forbids redistributing real records:
 """
 
 import pathlib
+import sys
 
 import numpy as np
 import pytest
@@ -76,7 +77,6 @@ def test_truncation_yields_whole_records_only(tmp_path: pathlib.Path) -> None:
 
 def test_no_tensorflow_is_imported() -> None:
     """The whole point: TF cannot share a process with array_record."""
-    import sys
 
     list(read_records(FIXTURE, limit=1))
     assert "tensorflow" not in sys.modules

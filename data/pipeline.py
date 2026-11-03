@@ -13,10 +13,52 @@ window shuffling would leave strong correlation inside every batch.
 import pathlib
 from collections.abc import Sequence
 
+import attrs
 import grain
 
-from data.specs import DEFAULT_BUDGETS, Budget, DatasetSpec
-from data.transforms import AgentCentric, DecodeScenario, PadAndMask, RandomRotate
+from core.distributed import Shard
+from data.specs import DEFAULT_BUDGETS, Budget, DatasetSpec, TimeWindow
+from data.transforms import (
+    AgentCentric,
+    DecodeScenario,
+    DropMap,
+    PadAndMask,
+    RandomRotate,
+    Resample,
+    ShapeChecks,
+)
+
+
+@attrs.frozen(kw_only=True)
+class Stages:
+    """Which optional per-scene transforms run -- a model-side choice.
+
+    The defaults are the full canonical pipeline. Turn off what a model does
+    not consume: each stage is per-scene Python on the CPU, and the input
+    pipeline is what usually starves the accelerator.
+    """
+
+    # Re-express each scene in the ego's frame (`AgentCentric`). A model that
+    # builds its own frames on device (the forecaster: every agent in its own)
+    # makes this a no-op.
+    ego_frame: bool = True
+    # Random rotation about the ego. None: when training. Needs `ego_frame`.
+    augment: bool | None = None
+    # False drops the vector map before any transform touches it, for models
+    # that never read it; batches keep the schema's shapes, every polyline
+    # masked out. Pair True with a polyline budget the map encoder can use.
+    keep_map: bool = True
+    # A coarser, shorter timeline (`data.specs.TimeWindow`); None keeps the
+    # dataset's own. Scenarios -- and `output_spec` -- then describe the window.
+    window: TimeWindow | None = None
+
+    def output_spec(self, spec: DatasetSpec) -> DatasetSpec:
+        """The spec of the scenarios this pipeline yields."""
+        return spec if self.window is None else self.window.apply(spec)
+
+    def __attrs_post_init__(self) -> None:
+        if self.augment and not self.ego_frame:
+            raise ValueError("augment rotates about the ego, so it needs ego_frame")
 
 
 def build(
@@ -28,8 +70,12 @@ def build(
     budget: Budget | None = None,
     training: bool = True,
     shuffle: bool | None = None,
+    repeat: bool = False,
+    shard: Shard | None = None,
     num_workers: int = 0,
     max_rotation: float = 3.141592653589793,
+    stages: Stages = Stages(),
+    shape_checks: bool = True,
 ) -> grain.IterDataset:
     """Build the training/eval input pipeline over ArrayRecord shards.
 
@@ -46,10 +92,18 @@ def build(
       training: enables augmentation and drops the short final batch. Set False
         for eval, where every example must be seen exactly once.
       shuffle: defaults to `training`.
+      shard: which rows this process reads. Defaults to one slice per JAX
+        process, so under multi-host training `batch_size` is per process.
+      repeat: cycle forever, for step-budgeted training. Each epoch is
+        reshuffled and re-augmented, since both are keyed by the global index.
       num_workers: multiprocessing workers. 0 keeps everything in-process,
         which is what you want in tests -- Grain spawns workers, so an
         exception in a transform is much easier to read without them.
-      max_rotation: augmentation range in radians; ignored unless `training`.
+      max_rotation: augmentation range in radians; ignored unless augmenting.
+      stages: which optional transforms run; see `Stages`.
+      shape_checks: run eincheck's per-example shape checks. Ingest already
+        validated every record, so turning them off loses no safety and
+        removes most of the pipeline's CPU cost.
 
     Returns:
       An `IterDataset` yielding batched `Scenario`s with `n=(batch_size,)`.
@@ -57,6 +111,9 @@ def build(
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
     shuffle = training if shuffle is None else shuffle
+    augment = training if stages.augment is None else stages.augment
+    if augment and not stages.ego_frame:
+        raise ValueError("augment rotates about the ego, so it needs ego_frame")
     budget = DEFAULT_BUDGETS[spec.name] if budget is None else budget
 
     if isinstance(paths, (str, pathlib.Path)):
@@ -65,13 +122,22 @@ def build(
 
     # .seed() must precede any random transform -- grain raises otherwise. It
     # also makes the whole pipeline reproducible from `seed` alone.
-    ds = grain.MapDataset.source(source).seed(seed)
+    shard = Shard.current() if shard is None else shard
+    ds = grain.MapDataset.source(source)[shard.index :: shard.count].seed(seed)
     if shuffle:
         ds = ds.shuffle(seed=seed)
+    if repeat:
+        ds = ds.repeat()
 
+    ds = ds.map(ShapeChecks(enabled=shape_checks))
     ds = ds.map(DecodeScenario())
-    ds = ds.map(AgentCentric())
-    if training:
+    if stages.window is not None:
+        ds = ds.map(Resample(window=stages.window))
+    if not stages.keep_map:
+        ds = ds.map(DropMap())
+    if stages.ego_frame:
+        ds = ds.map(AgentCentric())
+    if augment:
         ds = ds.random_map(RandomRotate(max_angle=max_rotation))
 
     # Last per-example step: .batch() stacks, so shapes must already match.

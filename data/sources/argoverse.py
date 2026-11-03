@@ -18,7 +18,9 @@ mask; tracks in a real scenario run anywhere from 10 to 110 steps.
 import json
 import pathlib
 from collections.abc import Iterator
+from typing import Any
 
+import eincheck
 import numpy as np
 import pyarrow.parquet as pq
 
@@ -57,17 +59,35 @@ def _xy(vertices: list[dict]) -> np.ndarray:
     return np.array([[v["x"], v["y"]] for v in vertices], dtype=np.float64)
 
 
-def _polylines(map_json: dict, spec: DatasetSpec) -> tuple[np.ndarray, np.ndarray]:
+def _polylines(
+    map_json: dict[str, Any], spec: DatasetSpec
+) -> tuple[np.ndarray, np.ndarray]:
     """Flatten the map into (points, types) arrays of fixed-length polylines."""
     points: list[np.ndarray] = []
     types: list[int] = []
 
-    def add(vertices: list[dict], kind: PolylineType) -> None:
+    def add(vertices: list[dict] | np.ndarray, kind: PolylineType) -> None:
         if len(vertices) < 1:
             return
-        points.append(geometry.resample_polyline(_xy(vertices), spec.max_points))
-        types.append(int(kind))
+        xy = vertices if isinstance(vertices, np.ndarray) else _xy(vertices)
+        # One feature can become several polylines: `spec.max_spacing` caps the
+        # resulting point spacing, so a long boundary is split rather than
+        # stretched over a fixed 20 points. Lanes are already finer than the cap
+        # and come back as a single chunk.
+        chunks = geometry.chunk_polyline(xy, spec.max_points, spec.max_spacing)
+        points.extend(chunks)
+        types.extend([int(kind)] * len(chunks))
 
+    # Shape checks off for the per-polyline geometry: a scene has ~150 map
+    # features, and eincheck's per-call overhead was ~70% of ingest time. The
+    # assembled `Scenario` is still checked, and ingest re-validates every
+    # record it writes.
+    with eincheck.disable_checks():
+        _add_features(map_json, add)
+    return _stack(points, types, spec)
+
+
+def _add_features(map_json: dict[str, Any], add: Any) -> None:
     for lane in map_json.get("lane_segments", {}).values():
         add(lane["centerline"], PolylineType.LANE_CENTER)
         for side in ("left", "right"):
@@ -85,9 +105,20 @@ def _polylines(map_json: dict, spec: DatasetSpec) -> tuple[np.ndarray, np.ndarra
         add(crossing["edge1"], PolylineType.CROSSWALK)
         add(crossing["edge2"], PolylineType.CROSSWALK)
 
-    for area in map_json.get("drivable_areas", {}).values():
-        add(area["area_boundary"], PolylineType.ROAD_EDGE)
+    # AV2 tiles the drivable area into adjacent polygons, so each polygon's
+    # boundary includes seams that run straight across the road. The road edge
+    # is the outline of their union, where those seams cancel.
+    rings = [
+        _xy(area["area_boundary"])
+        for area in map_json.get("drivable_areas", {}).values()
+    ]
+    for edge in geometry.union_outline(rings):
+        add(edge, PolylineType.ROAD_EDGE)
 
+
+def _stack(
+    points: list[np.ndarray], types: list[int], spec: DatasetSpec
+) -> tuple[np.ndarray, np.ndarray]:
     if not points:
         return (
             np.zeros((0, spec.max_points, 2), dtype=np.float32),
@@ -169,19 +200,30 @@ _EXTENT_PRIOR = np.array(
 )
 
 
+def _sole(scenario_dir: pathlib.Path, pattern: str) -> pathlib.Path:
+    """The one file matching `pattern`, or a message saying what is wrong.
+
+    A bare `[x] = sorted(...)` is the right strictness -- exactly one match, not
+    "the first of several" -- but its ValueError ("not enough values to unpack")
+    says nothing about which directory or which file is missing, which is
+    useless 200k scenarios into an ingest.
+    """
+    matches = sorted(scenario_dir.glob(pattern))
+    if len(matches) != 1:
+        raise FileNotFoundError(
+            f"{scenario_dir} is not an AV2 scenario directory: expected exactly "
+            f"one {pattern}, found {len(matches)}"
+        )
+    return matches[0]
+
+
 def load_scenario(scenario_dir: pathlib.Path, spec: DatasetSpec = AV2) -> Scenario:
     """Read one AV2 scenario directory into a canonical `Scenario`."""
-    parquets = sorted(scenario_dir.glob("scenario_*.parquet"))
-    maps = sorted(scenario_dir.glob("log_map_archive_*.json"))
-    if not parquets or not maps:
-        raise FileNotFoundError(
-            f"{scenario_dir} is not an AV2 scenario directory "
-            "(need scenario_*.parquet and log_map_archive_*.json)"
-        )
-
-    columns = pq.read_table(parquets[0]).to_pydict()
+    parquet = _sole(scenario_dir, "scenario_*.parquet")
+    map_json = _sole(scenario_dir, "log_map_archive_*.json")
+    columns = pq.read_table(parquet).to_pydict()
     agents, focal_index = _agents(columns, spec)
-    points, types = _polylines(json.loads(maps[0].read_text()), spec)
+    points, types = _polylines(json.loads(map_json.read_text()), spec)
 
     num_agents = np.asarray(agents.position).shape[0]
     return Scenario(
@@ -203,7 +245,20 @@ def load_scenario(scenario_dir: pathlib.Path, spec: DatasetSpec = AV2) -> Scenar
     )
 
 
-def iter_scenarios(root: pathlib.Path, spec: DatasetSpec = AV2) -> Iterator[Scenario]:
-    """Yield every scenario under an AV2 split directory, in sorted order."""
-    for scenario_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+def iter_scenarios(
+    root: pathlib.Path,
+    spec: DatasetSpec = AV2,
+    *,
+    worker_index: int = 0,
+    num_workers: int = 1,
+) -> Iterator[Scenario]:
+    """Yield the scenarios under an AV2 split directory, in sorted order.
+
+    With `num_workers > 1`, only every `num_workers`-th directory from
+    `worker_index` -- selected from the *listing*, before anything is decoded.
+    Filtering decoded scenarios instead costs each of N workers the whole
+    split's decode time, for 1/N of the output.
+    """
+    dirs = sorted(p for p in root.iterdir() if p.is_dir())
+    for scenario_dir in dirs[worker_index::num_workers]:
         yield load_scenario(scenario_dir, spec)

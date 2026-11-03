@@ -255,6 +255,81 @@ def chunk_polyline(
     )
 
 
+def union_outline(rings: "list[np.ndarray]", decimals: int = 3) -> "list[np.ndarray]":
+    """The outline of a union of polygons that tile without overlap, as polylines.
+
+    Map formats often split one surface into adjacent polygons -- AV2 tiles its
+    drivable area -- and every seam between two tiles is a side of both. Drawn
+    or fed to a model as-is, each seam is a line straight across the road that
+    nothing physical corresponds to. On the outline of the *union* those seams
+    cancel: a side shared by two polygons is interior and is dropped, and what
+    is left is chained into maximal paths.
+
+    Vertices are matched after rounding to `decimals` places, since tiles share
+    vertices exactly in the source but not always bit-for-bit after a float
+    round-trip. Only sides shared vertex-to-vertex cancel; a seam that meets
+    its neighbour mid-side (a T-junction) survives, so this is exact for
+    tilings that share vertices and conservative otherwise.
+
+    `rings` are `(k, 2)` vertex arrays, open or closed (last == first). Each
+    returned polyline is `(m, 2)`, and closed outlines come back closed.
+    **Ingest only**, like `chunk_polyline`: data-dependent shapes do not trace.
+    """
+    coords: dict[tuple[float, float], np.ndarray] = {}
+    count: dict[frozenset[tuple[float, float]], int] = {}
+
+    def key(point: np.ndarray) -> tuple[float, float]:
+        k = (round(float(point[0]), decimals), round(float(point[1]), decimals))
+        coords.setdefault(k, np.asarray(point, dtype=np.float64))
+        return k
+
+    for ring in rings:
+        ring = np.asarray(ring)
+        if len(ring) < 2:
+            continue
+        keys = [key(v) for v in ring]
+        if keys[0] != keys[-1]:
+            keys.append(keys[0])
+        for a, b in zip(keys, keys[1:]):
+            if a != b:
+                edge = frozenset((a, b))
+                count[edge] = count.get(edge, 0) + 1
+
+    neighbours: dict[tuple[float, float], list[tuple[float, float]]] = {}
+    for edge, n in count.items():
+        if n == 1:
+            a, b = tuple(edge)
+            neighbours.setdefault(a, []).append(b)
+            neighbours.setdefault(b, []).append(a)
+
+    unused = {frozenset((a, b)) for a, nbrs in neighbours.items() for b in nbrs}
+
+    def walk(start: tuple[float, float]) -> list[tuple[float, float]]:
+        path = [start]
+        while True:
+            nxt = next(
+                (b for b in neighbours[path[-1]] if frozenset((path[-1], b)) in unused),
+                None,
+            )
+            if nxt is None:
+                return path
+            unused.discard(frozenset((path[-1], nxt)))
+            path.append(nxt)
+
+    paths: list[list[tuple[float, float]]] = []
+    # Open chains first, from their ends (any vertex of odd degree), so each is
+    # one path rather than two halves meeting in the middle...
+    for v in sorted(neighbours):
+        if len(neighbours[v]) % 2 == 1:
+            while any(frozenset((v, b)) in unused for b in neighbours[v]):
+                paths.append(walk(v))
+    # ...then whatever is left is closed loops.
+    for v in sorted(neighbours):
+        while any(frozenset((v, b)) in unused for b in neighbours[v]):
+            paths.append(walk(v))
+    return [np.stack([coords[k] for k in path]) for path in paths if len(path) > 1]
+
+
 @eincheck.check_func("a 2, 2 -> a")
 def distance_to(points: jt.ArrayLike, reference: jt.ArrayLike) -> jt.ArrayLike:
     """Euclidean distance from each point to a single reference point."""

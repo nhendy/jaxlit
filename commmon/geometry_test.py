@@ -5,6 +5,8 @@ round-trips are what actually break when a sign or a transpose is wrong, and
 they hold at every angle rather than the one that happened to be in the fixture.
 """
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -20,6 +22,7 @@ from commmon.geometry import (
     rotate_direction,
     rotation_matrix,
     transform_se2,
+    union_outline,
     wrap_angle,
 )
 
@@ -257,7 +260,6 @@ def test_a_shared_extent_serves_every_box() -> None:
 
 
 def test_box_corners_trace_under_jit(jnp_module) -> None:
-    import jax
 
     out = jax.jit(box_corners)(
         jnp_module.zeros((3, 2)), jnp_module.zeros(3), jnp_module.ones((3, 2))
@@ -489,7 +491,6 @@ def test_transform_se2_rejects_bad_translation() -> None:
 
 @pytest.fixture
 def jnp_module():
-    import jax.numpy as jnp
 
     return jnp
 
@@ -515,7 +516,6 @@ def test_resample_matches_between_numpy_and_jax(jnp_module) -> None:
 
 def test_geometry_traces_under_jit(jnp_module) -> None:
     """Value branches or np.asarray on an input would raise here."""
-    import jax
 
     @jax.jit
     def body(points, angle):
@@ -528,7 +528,6 @@ def test_geometry_traces_under_jit(jnp_module) -> None:
 
 def test_degenerate_polyline_traces_under_jit(jnp_module) -> None:
     """The zero-length guard is a clamp, not a branch -- so it must trace."""
-    import jax
 
     out = jax.jit(lambda line: resample_polyline(line, 4))(
         jnp_module.array([[1.0, 1.0], [1.0, 1.0]])
@@ -539,7 +538,6 @@ def test_degenerate_polyline_traces_under_jit(jnp_module) -> None:
 
 def test_jax_output_stays_a_jax_array(points: np.ndarray, jnp_module) -> None:
     """Dispatch must not silently round-trip through numpy."""
-    import jax
 
     out = rotate(jnp_module.asarray(points), jnp_module.float32(0.4))
     assert isinstance(out, jax.Array)
@@ -631,7 +629,44 @@ def test_a_misaligned_angle_is_rejected() -> None:
 
 
 def test_batched_angles_trace_under_jit(jnp_module) -> None:
-    import jax
 
     out = jax.jit(rotate)(jnp_module.ones((3, 4, 2)), jnp_module.zeros((3, 1)))
     assert out.shape == (3, 4, 2)
+
+
+def _square(x0: float, y0: float) -> np.ndarray:
+    return np.array([[x0, y0], [x0 + 1, y0], [x0 + 1, y0 + 1], [x0, y0 + 1]])
+
+
+def _length(polylines: list[np.ndarray]) -> float:
+    return sum(
+        float(np.linalg.norm(np.diff(p, axis=0), axis=-1).sum()) for p in polylines
+    )
+
+
+def test_union_outline_cancels_shared_sides() -> None:
+    # Two unit squares side by side: the seam at x=1 is interior.
+    out = union_outline([_square(0, 0), _square(1, 0)])
+    assert len(out) == 1
+    assert _length(out) == pytest.approx(6.0)  # 2x1 rectangle, no seam
+    np.testing.assert_allclose(out[0][0], out[0][-1])  # comes back closed
+    assert not any(np.allclose(v, [1.0, 0.5]) for v in out[0])
+
+
+def test_union_outline_keeps_separate_polygons_separate() -> None:
+    out = union_outline([_square(0, 0), _square(5, 0)])
+    assert len(out) == 2
+    assert _length(out) == pytest.approx(8.0)
+
+
+def test_union_outline_accepts_closed_rings_and_float_noise() -> None:
+    a = np.vstack([_square(0, 0), [[0.0, 0.0]]])  # explicitly closed
+    b = _square(1, 0) + 1e-6  # same seam, off by float noise
+    assert _length(union_outline([a, b])) == pytest.approx(6.0, abs=1e-4)
+
+
+def test_union_outline_of_a_grid_is_its_perimeter() -> None:
+    tiles = [_square(x, y) for x in range(3) for y in range(2)]
+    out = union_outline(tiles)
+    assert len(out) == 1
+    assert _length(out) == pytest.approx(10.0)

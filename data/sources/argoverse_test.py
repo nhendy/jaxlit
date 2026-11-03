@@ -9,14 +9,22 @@ test our own assumptions back at us.
 import json
 import pathlib
 
+import attrs
 import numpy as np
 import pytest
 
 from commmon.fixtures import parameterized_fixture
+from commmon.geometry import chunk_polyline
 from data.ingest.writer import write_shards
 from data.pipeline import build
 from data.schema import Scenario, decode_scenario_id
-from data.sources.argoverse import _OBJECT_TYPE, iter_scenarios, load_scenario
+from data.sources.argoverse import (
+    _OBJECT_TYPE,
+    _polylines,
+    _xy,
+    iter_scenarios,
+    load_scenario,
+)
 from data.specs import AV2, DEFAULT_BUDGETS, AgentType, PolylineType
 from data.transforms import AgentCentric, PadAndMask
 
@@ -124,25 +132,57 @@ def test_lane_centerlines_are_present(scenario: Scenario) -> None:
     assert (types == int(PolylineType.LANE_CENTER)).sum() > 0
 
 
+def _boundary_count(types: np.ndarray) -> int:
+    return int(
+        np.isin(
+            types,
+            [
+                int(PolylineType.LANE_BOUNDARY_SOLID),
+                int(PolylineType.LANE_BOUNDARY_DASHED),
+            ],
+        ).sum()
+    )
+
+
 def test_unmarked_boundaries_are_skipped(scenario_dir: pathlib.Path) -> None:
-    """`NONE` markings are not physical features and must not become polylines."""
+    """`NONE` markings are not physical features and must not become polylines.
+
+    Counted in *chunks* rather than features: one boundary longer than
+    `max_spacing * (max_points - 1)` is split into several polylines, so the
+    old one-polyline-per-feature identity no longer holds. The selection is
+    still what is under test -- `chunk_polyline` has its own coverage.
+    """
     raw = json.loads(next(scenario_dir.glob("log_map_archive_*.json")).read_text())
-    lanes = raw["lane_segments"].values()
-    marked = sum(
-        1
-        for lane in lanes
+    expected = sum(
+        len(
+            chunk_polyline(
+                _xy(lane[f"{side}_lane_boundary"]), AV2.max_points, AV2.max_spacing
+            )
+        )
+        for lane in raw["lane_segments"].values()
         for side in ("left", "right")
         if lane.get(f"{side}_lane_mark_type", "NONE") != "NONE"
     )
     types = np.asarray(load_scenario(scenario_dir).vector_map.types)
-    boundaries = np.isin(
-        types,
-        [
-            int(PolylineType.LANE_BOUNDARY_SOLID),
-            int(PolylineType.LANE_BOUNDARY_DASHED),
-        ],
-    ).sum()
-    assert boundaries == marked
+    assert _boundary_count(types) == expected
+
+
+def test_an_all_unmarked_map_yields_no_boundaries() -> None:
+    """The selection itself, isolated from whatever the real fixtures happen to hold."""
+    lane = {
+        "centerline": [{"x": 0.0, "y": 0.0}, {"x": 10.0, "y": 0.0}],
+        "left_lane_boundary": [{"x": 0.0, "y": 2.0}, {"x": 10.0, "y": 2.0}],
+        "right_lane_boundary": [{"x": 0.0, "y": -2.0}, {"x": 10.0, "y": -2.0}],
+        "left_lane_mark_type": "NONE",
+        "right_lane_mark_type": "NONE",
+    }
+    _, types = _polylines({"lane_segments": {"0": lane}}, AV2)
+    assert _boundary_count(types) == 0
+    assert (types == int(PolylineType.LANE_CENTER)).sum() == 1
+
+    marked = {**lane, "left_lane_mark_type": "SOLID_WHITE"}
+    _, types = _polylines({"lane_segments": {"0": marked}}, AV2)
+    assert _boundary_count(types) == 1
 
 
 # --- identity and errors ------------------------------------------------------
@@ -233,11 +273,8 @@ def test_budgets_cover_the_real_distribution() -> None:
 
 def test_polyline_truncation_keeps_the_nearest(scenario: Scenario) -> None:
     """Positional truncation would delete whole map categories, not far geometry."""
-    import attrs as _attrs
 
-    from data.transforms import AgentCentric, PadAndMask
-
-    tiny = _attrs.evolve(DEFAULT_BUDGETS["av2"], max_polylines=8)
+    tiny = attrs.evolve(DEFAULT_BUDGETS["av2"], max_polylines=8)
     # The scenario carries its spec, so it has to be evolved too -- PadAndMask
     # refuses a scenario whose spec differs from its own.
     centred = AgentCentric().map(scenario)

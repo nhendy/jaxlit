@@ -26,9 +26,27 @@ import grain
 import numpy as np
 
 from commmon import arrays, geometry
+from commmon.checks import set_shape_checks
 from data import codec
 from data.schema import AgentTracks, Scenario, VectorMap
-from data.specs import Budget
+from data.specs import Budget, TimeWindow
+
+
+@attrs.frozen
+class ShapeChecks(grain.transforms.Map):
+    """Apply the run's eincheck setting in whichever process runs the pipeline.
+
+    First in the pipeline, on the raw bytes. Grain spawns its workers, so they
+    do not inherit `commmon.checks.set_shape_checks` from the parent; this
+    transform is pickled into each worker and sets it there. A no-op after the
+    first element.
+    """
+
+    enabled: bool
+
+    def map(self, element: bytes) -> bytes:
+        set_shape_checks(self.enabled)
+        return element
 
 
 @attrs.frozen
@@ -111,6 +129,52 @@ class RandomRotate(grain.transforms.RandomMap):
     def random_map(self, scenario: Scenario, rng: np.random.Generator) -> Scenario:
         angle = np.float32(rng.uniform(-self.max_angle, self.max_angle))
         return _transform(scenario, np.zeros(2, dtype=np.float32), angle)
+
+
+@attrs.frozen
+class Resample(grain.transforms.Map):
+    """Cut every per-timestep agent field down to a `TimeWindow`.
+
+    Right after decode, so every later stage -- and the batch shipped to the
+    device -- handles only the steps the model uses.
+    """
+
+    window: TimeWindow
+
+    def map(self, scenario: Scenario) -> Scenario:
+        keep = np.asarray(self.window.indices(scenario.spec))
+        agents = scenario.agents
+        return scenario.replace(
+            agents=agents.replace(
+                position=np.asarray(agents.position)[:, keep],
+                heading=np.asarray(agents.heading)[:, keep],
+                velocity=np.asarray(agents.velocity)[:, keep],
+                valid=np.asarray(agents.valid)[:, keep],
+            ),
+            spec=self.window.apply(scenario.spec),
+        )
+
+
+@attrs.frozen
+class DropMap(grain.transforms.Map):
+    """Replace the vector map with an empty one, for models that never read it.
+
+    A scene's ~200 polylines are most of what the later stages transform and
+    sort; dropping them first makes those stages cost a few agents' worth.
+    `PadAndMask` then pads the map to the budget with masked-out rows, so the
+    batch keeps the schema's shapes.
+    """
+
+    def map(self, scenario: Scenario) -> Scenario:
+        s = scenario.spec.max_points
+        return scenario.replace(
+            vector_map=VectorMap(
+                points=np.zeros((0, s, 2), dtype=np.float32),
+                types=np.zeros((0,), dtype=np.int32),
+                valid=np.zeros((0, s), dtype=bool),
+            ),
+            polyline_mask=np.zeros((0,), dtype=bool),
+        )
 
 
 def _select_agents(scenario: Scenario, max_agents: int) -> np.ndarray:

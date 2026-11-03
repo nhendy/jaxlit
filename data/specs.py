@@ -82,6 +82,22 @@ class DatasetSpec:
     Applied at *ingest*, so changing it means re-converting the corpus. It lives
     here rather than in `Budget` for exactly that reason.
     """
+    max_spacing: float = float("inf")
+    """Metres between consecutive points, above which a polyline is split in two.
+
+    `max_points` alone spends a fixed budget on a polyline of any length, so a
+    20 m lane centerline and a 500 m drivable-area ring get the same 20 points
+    -- metre resolution for one, 25 m chords for the other. This caps the
+    resulting spacing instead, and `commmon.geometry.chunk_polyline` emits as
+    many fixed-length polylines as that takes.
+
+    The cost is polyline count, which is what `Budget.max_polylines` pays for,
+    so the right value is per dataset: set it near the source's own native
+    resolution (finer only interpolates detail the data never had) and leave it
+    `inf` where the map budget binds harder than the fidelity.
+
+    Ingest-time like `max_points`, and changing it means re-converting.
+    """
 
     @property
     def num_future(self) -> int:
@@ -97,6 +113,47 @@ class DatasetSpec:
 
 
 @attrs.frozen(kw_only=True)
+class TimeWindow:
+    """A coarser, shorter view of a dataset's timeline, chosen by the model.
+
+    Keeps every `stride`-th step, aligned so the last observed step -- the one
+    every frame and target is relative to -- is kept: `history` steps up to
+    and including it, and every stride-th future step after it. With AV2
+    (10 Hz, 50 observed), `TimeWindow(stride=2, history=15)` is 5 Hz with
+    2.8 s of history and the full 6 s future: 45 steps instead of 110.
+
+    Like `Budget`, a model knob applied when loading: no re-ingest.
+    """
+
+    stride: int = attrs.field(validator=attrs.validators.gt(0))
+    history: int = attrs.field(validator=attrs.validators.gt(0))
+
+    def indices(self, spec: DatasetSpec) -> "list[int]":
+        now = spec.num_history - 1
+        first = now - self.stride * (self.history - 1)
+        if first < 0:
+            raise ValueError(
+                f"{self} needs {self.stride * (self.history - 1) + 1} observed steps; "
+                f"{spec.name} has {spec.num_history}"
+            )
+        return list(range(first, spec.num_steps, self.stride))
+
+    def apply(self, spec: DatasetSpec) -> DatasetSpec:
+        """The spec of a scenario after this window.
+
+        Renamed, so the codec -- which stores specs by name -- refuses to
+        encode a resampled scenario as if it were the full-rate dataset.
+        """
+        return attrs.evolve(
+            spec,
+            name=f"{spec.name}/{self.stride}",
+            dt=spec.dt * self.stride,
+            num_steps=len(self.indices(spec)),
+            num_history=self.history,
+        )
+
+
+@attrs.frozen(kw_only=True)
 class Budget:
     """How many agents and polylines to pad to. A model knob, not a dataset fact.
 
@@ -108,9 +165,13 @@ class Budget:
     scenarios::
 
         agents     p50  54  p90  96  p95 114  p99 121  max 122
-        polylines  p50 146  p90 276  p95 287  p99 335  max 354
+        polylines  p50 210  p90 343  p95 356  p99 412  max 424
 
     An earlier 64/256 silently truncated 32% and 12.5% of scenarios.
+
+    The polyline row is measured *with* `DatasetSpec.max_spacing` in force --
+    chunking long features is what moved it from p99 335 to p99 412. Lower that
+    cap and re-measure before assuming 512 still clears it.
     """
 
     max_agents: int
@@ -129,7 +190,21 @@ class Budget:
 WOMD = DatasetSpec(name="womd", dt=0.1, num_steps=91, num_history=11, max_points=20)
 
 # 10 Hz, 5.0 s observed + 6.0 s future.
-AV2 = DatasetSpec(name="av2", dt=0.1, num_steps=110, num_history=50, max_points=20)
+#
+# max_spacing=2.0 matches AV2's own centerline sampling (measured p50 1.92 m
+# over 40 val maps), so it costs nothing on lanes -- they are already finer than
+# this and stay one polyline each. It exists for `drivable_areas`, whose
+# boundaries are 455 m rings (p50; max 1605 m) that a flat 20 points turns into
+# 9 m of error. Measured over those maps: 0.70 m error at p99 and 412 polylines
+# at p99, against 9.16 m and 336 before.
+AV2 = DatasetSpec(
+    name="av2",
+    dt=0.1,
+    num_steps=110,
+    num_history=50,
+    max_points=20,
+    max_spacing=2.0,
+)
 
 # 2 Hz, 2.0 s history + 6.0 s future. Far coarser than the other two, which is
 # why `dt` is a per-scenario constant rather than a global.
@@ -141,7 +216,7 @@ ALL_SPECS: dict[str, DatasetSpec] = {s.name: s for s in (WOMD, AV2, NUSCENES)}
 
 # Starting points, not gospel -- override per experiment.
 DEFAULT_BUDGETS: dict[str, Budget] = {
-    # Measured: covers the observed max of 122 agents / 354 polylines.
+    # Measured: covers the observed max of 122 agents / 424 polylines.
     "av2": Budget(max_agents=128, max_polylines=512),
     # Measured over 120 real validation scenarios:
     #     agents        p50  59  p90 141  p99 267  max  288
